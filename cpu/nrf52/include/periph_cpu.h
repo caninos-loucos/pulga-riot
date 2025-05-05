@@ -28,6 +28,15 @@ extern "C" {
 #endif
 
 /**
+ * @name    Power management configuration
+ * @{
+ */
+#define PROVIDES_PM_SET_LOWEST
+#define PROVIDES_PM_RESTART
+#define PROVIDES_PM_OFF
+#define PROVIDES_PM_LAYERED_OFF
+
+/**
  * @brief   Enable the workaround for the SPI single byte transmit errata (No.
  * 58 on the nrf52832)
  */
@@ -268,6 +277,12 @@ void spi_twi_irq_register_i2c(NRF_TWIM_Type *bus,
  * @brief USBDEV buffers must be word aligned because of DMA restrictions
  */
 #define USBDEV_CPU_DMA_ALIGNMENT       (4)
+
+/**
+ * @brief   Number of usable low power modes
+   FIXME: not sure what is the actual number of modes (see datasheet)
+ */
+#define PM_NUM_MODES            (3U)
 
 /**
  * @brief USBDEV buffer instantiation requirement
