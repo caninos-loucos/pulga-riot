@@ -26,6 +26,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <time.h>
 
 #include "bq2429x.h"
 
@@ -38,8 +39,12 @@
 
 #include "net/loramac.h"
 #include "semtech_loramac.h"
+#include "net/netdev/lora.h"
+#include "net/netdev.h"
+#include "net/lora.h"
 
 #include "sx127x.h"
+#include "sx127x_internal.h"
 #include "sx127x_netdev.h"
 #include "sx127x_params.h"
 
@@ -50,6 +55,7 @@
 
 #include "board.h"
 #include "periph/adc.h"
+#include "periph/pm.h"
 
 #include "ringbuffer.h"
 #include "periph/uart.h"
@@ -57,6 +63,8 @@
 
 #include "ztimer.h"
 #include "shell.h"
+#include "sched.h"
+#include "log.h"
 
 #define PMTK_SET_NMEA_OUTPUT_RMC    "$PMTK314,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0*29\r\n"
 #define PMTK_SET_UPDATE_F_2HZ       "$PMTK300,500,0,0,0,0*28\r\n"
@@ -153,6 +161,115 @@ static uint8_t appskey[LORAMAC_APPSKEY_LEN];
 static uint8_t nwkskey[LORAMAC_NWKSKEY_LEN];
 static uint8_t devaddr[LORAMAC_DEVADDR_LEN];
 
+int reset_lora_driver(void)
+{
+    netdev_t *netdev = &sx127x.netdev;
+
+    printf("[lora] resetting sx127x\n");
+    netopt_state_t state = NETOPT_STATE_RESET;
+
+    netdev->driver->set(netdev, NETOPT_STATE, &state, sizeof(netopt_state_t));
+    return 0;
+}
+
+static void _event_cb(netdev_t *dev, netdev_event_t event)
+{
+    (void) dev;
+    switch (event) {
+
+    case NETDEV_EVENT_TX_COMPLETE:
+        sx127x_set_sleep(&sx127x);
+        printf("[lora] transmission completed");
+        break;
+
+    case NETDEV_EVENT_CAD_DONE:
+        break;
+
+    case NETDEV_EVENT_TX_TIMEOUT:
+        sx127x_set_sleep(&sx127x);
+        break;
+
+    default:
+        printf("[lora] unexpected netdev event received: %d\n", event);
+        break;
+    }
+}
+
+int init_lora_driver(void)
+{
+    sx127x.params = sx127x_params[0];
+    netdev_t *netdev = &sx127x.netdev;
+
+    netdev->driver = &sx127x_driver;
+
+    if (netdev->driver->init(netdev) < 0) {
+        printf("[lora] failed to initialize SX127x device, exiting");
+        return 1;
+    }
+
+    netdev->event_callback = _event_cb;
+    return 0;
+}
+
+void init_lorawan(void)
+{
+    printf("[lora] initializing lorawan...\n");
+
+    /* Convert identifiers and application key */
+    fmt_hex_bytes(deveui, CONFIG_LORAMAC_DEV_EUI_DEFAULT);
+    fmt_hex_bytes(appeui, CONFIG_LORAMAC_APP_EUI_DEFAULT);
+
+    fmt_hex_bytes(devaddr, CONFIG_LORAMAC_DEV_ADDR_DEFAULT);
+    fmt_hex_bytes(nwkskey, CONFIG_LORAMAC_NWK_SKEY_DEFAULT);
+    fmt_hex_bytes(appskey, CONFIG_LORAMAC_APP_SKEY_DEFAULT);
+
+    /* Initialize the radio driver */
+    sx127x_setup(&sx127x, &sx127x_params[0], 0);
+    loramac.netdev = &sx127x.netdev;
+    loramac.netdev->driver = &sx127x_driver;
+
+    semtech_loramac_init(&loramac);
+
+    semtech_loramac_set_deveui(&loramac, deveui);
+    semtech_loramac_set_appeui(&loramac, appeui);
+    semtech_loramac_set_devaddr(&loramac, devaddr);
+    semtech_loramac_set_appskey(&loramac, appskey);
+    semtech_loramac_set_nwkskey(&loramac, nwkskey);
+
+    /* Set a channels mask that makes it use only the first 8 channels */
+    uint16_t channel_mask[LORAMAC_CHANNELS_MASK_LEN] = { 0 };
+    channel_mask[0] = 0x00FF;
+    semtech_loramac_set_channels_mask(&loramac, channel_mask);
+
+    semtech_loramac_set_adr(&loramac, false);
+    semtech_loramac_set_dr(&loramac, LORAMAC_DR_5);
+    printf("[lora] lorawan initialized with DEV_EUI=%s\n", CONFIG_LORAMAC_DEV_EUI_DEFAULT);
+}
+
+bool joined = false;
+int join_lorawan(void)
+{
+    printf("[lora] starting join procedure\n");
+    if (semtech_loramac_join(&loramac, LORAMAC_JOIN_ABP) != SEMTECH_LORAMAC_JOIN_SUCCEEDED) {
+        printf("[lora] join procedure failed\n");
+        return 1;
+    }
+    joined = true;
+    printf("[lora] join procedure succeeded\n");
+    return 0;
+}
+
+uint8_t send_count;
+int enable_lorawan(void)
+{
+    printf("[lora] enable_lorawan\n");
+    reset_lora_driver();
+    init_lora_driver();
+    init_lorawan();
+    send_count = 0;
+    return 0;
+}
+
 static void _alarm_cb(void *arg) {
    (void) arg;
    msg_t msg;
@@ -165,7 +282,7 @@ static void _prepare_next_alarm(void) {
 }
 
 
-static void _send_message(void) {
+static uint8_t _send_message(void) {
 
     //char *lora_msg = (char*)malloc(LORA_MSG_LEN*sizeof(char));
     //ringbuffer_get(&(ctx_lora.rx_buf), lora_msg, LORA_MSG_LEN);
@@ -175,10 +292,38 @@ static void _send_message(void) {
         printf("%02x", lora_msg[i]);
 
     /* Try to send the message */
-    uint8_t ret = semtech_loramac_send(&loramac,(uint8_t*)(lora_msg), LORA_MSG_LEN);
-    if (ret != SEMTECH_LORAMAC_TX_DONE)  {
-       printf("Cannot send message '%s', ret code: %d\n\n", message, ret);
+    uint8_t lora_ret = semtech_loramac_send(&loramac,(uint8_t*)(lora_msg), LORA_MSG_LEN);
+    uint8_t ret;
+    switch (lora_ret) {
+        case SEMTECH_LORAMAC_NOT_JOINED:
+            printf("[lora] cannot send: not joined\n");
+            joined = false;
+            ret = 2; // join and re-send message
+            break;
+        case SEMTECH_LORAMAC_BUSY:
+            printf("[lora] cannot send: MAC is busy\n");
+            ret = 3; // wait and re-send message
+            break;
+        case SEMTECH_LORAMAC_DUTYCYCLE_RESTRICTED:
+            printf("[lora] cannot send: dutycycle restriction\n");
+            ret = 1;
+            break;
+        case SEMTECH_LORAMAC_TX_ERROR:
+            printf("[lora] cannot send: error\n");
+            ret = 1;
+            break;
+        case SEMTECH_LORAMAC_TX_CNF_FAILED:
+            printf("[lora] fail to send: no ACK received\n");
+            ret = 1;
+            break;
+        default:
+            ret = 0;
+            printf("[lora] success sending message\n");
+            printf("[lora enum] %d \n", lora_ret);
+            break;
     }
+    send_count++;
+    return ret;
 
     //free(lora_msg);
 }
@@ -190,15 +335,36 @@ static void *sender(void *arg) {
     msg_t msg;
     msg_t msg_queue[8];
     msg_init_queue(msg_queue, 8);
+    uint8_t ret;
 
     while (1) {
         msg_receive(&msg);       
 
-       /* Trigger the message send */
-       _send_message();
+        if(!joined){
+            enable_lorawan();
+            if(join_lorawan() == 0){
+                _send_message();
+            }
+        }
+        else{
+            ret = _send_message();;
+            if(ret == 2){
+                enable_lorawan();
+                if(join_lorawan()== 0)
+                    _send_message();
+            }
+            else if(ret == 3){
+                ztimer_sleep(ZTIMER_MSEC, 3);
+                _send_message();
+            }
+        }
 
-       /* Schedule the next wake-up alarm */
-       _prepare_next_alarm();
+        /* Schedule the next wake-up alarm */
+        _prepare_next_alarm();
+
+        if(send_count >= 10) {
+            enable_lorawan();
+        }
     }
 
    /* this should never be reached */
@@ -633,42 +799,9 @@ int main(void) {
     puts("LoRaWAN Class A low-power application");
     puts("=====================================");
 
-    /* Convert identifiers and application key */
-    fmt_hex_bytes(deveui, CONFIG_LORAMAC_DEV_EUI_DEFAULT);
-    fmt_hex_bytes(appeui, CONFIG_LORAMAC_APP_EUI_DEFAULT);
-
-    fmt_hex_bytes(devaddr, CONFIG_LORAMAC_DEV_ADDR_DEFAULT);
-    fmt_hex_bytes(nwkskey, CONFIG_LORAMAC_NWK_SKEY_DEFAULT);
-    fmt_hex_bytes(appskey, CONFIG_LORAMAC_APP_SKEY_DEFAULT);
-
-    /* Initialize the radio driver */
-    sx127x_setup(&sx127x, &sx127x_params[0], 0);
-    loramac.netdev = &sx127x.netdev;
-    loramac.netdev->driver = &sx127x_driver;
-
-    /* Initialize the loramac stack */
-    semtech_loramac_init(&loramac);
-    semtech_loramac_set_deveui(&loramac, deveui);
-    semtech_loramac_set_appeui(&loramac, appeui);
-    semtech_loramac_set_devaddr(&loramac, devaddr);
-    semtech_loramac_set_appskey(&loramac, appskey);
-    semtech_loramac_set_nwkskey(&loramac, nwkskey);
-
-    /* Set a channels mask that makes it use only the first 8 channels */
-    uint16_t channel_mask[LORAMAC_CHANNELS_MASK_LEN] = { 0 };
-    channel_mask[0] = 0x00FF;
-    semtech_loramac_set_channels_mask(&loramac, channel_mask);
-
-    /* Use a fast datarate */
-    semtech_loramac_set_dr(&loramac, LORAMAC_DR_5);
-
-    /* Start the ABP procedure */
-    puts("Starting join procedure");
-    if (semtech_loramac_join(&loramac, LORAMAC_JOIN_ABP) != SEMTECH_LORAMAC_JOIN_SUCCEEDED) {
-        puts("Join procedure failed");
-        return 1;
-    }
-    puts("Join procedure succeeded");
+    init_lora_driver();
+    enable_lorawan();
+    join_lorawan();
 
     /* Start the Lora thread */
     sender_pid = thread_create(sender_stack, sizeof(sender_stack), SENDER_PRIO, 0, sender, NULL, "sender");
